@@ -1,27 +1,26 @@
-"""LLM step generator using Gemini.
+"""LLM step generator. Works with Claude (ANTHROPIC_API_KEY) or Gemini (GEMINI_API_KEY).
 
-Outputs the REAL nested schema (Goal -> Action -> StepGroup). Gemini only
-writes the goal/title/description/steps/category text; deeplinks are never
-written by the model. They are attached afterwards by matching each step's
-own text against the real catalog (same matcher app/fallback.py uses), so a
-deeplink URI can never be invented.
+The model only writes goal/title/description/steps/category text. Deeplinks are
+NEVER written by the model: they are attached afterwards by matching each step's
+own text against the real catalog, so a deeplink URI can never be invented.
+If no key is set or the call fails, this raises and pipeline.py uses the
+rule-based fallback instead - the API never returns an error.
 """
 import json
-
-from google import genai
-from google.genai import types
+import os
+import re
+import time
 
 from .deeplinks import get_catalog
 
-_client = None
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        _client = genai.Client()  # uses GEMINI_API_KEY from environment
-    return _client
-
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")  # fast: helps the 8s cold-start limit
+# Tried in order; if one is busy (503) or missing (404) the next is used automatically.
+GEMINI_MODELS = [m.strip() for m in os.getenv(
+    "GEMINI_MODELS", os.getenv("GEMINI_MODEL", "") or "gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.5-flash"
+).split(",") if m.strip()]
+TIMEOUT_S = 20          # Claude call timeout
+GEMINI_CALL_S = int(os.getenv("GEMINI_CALL_S", "10"))  # Gemini rejects anything under 10s
+GEMINI_BUDGET_S = 13    # do not start a new attempt after ~12s; busy (503) replies come back fast, so this rarely binds
 
 _SCHEMA_HINT = {
     "contexts": [
@@ -34,9 +33,7 @@ _SCHEMA_HINT = {
                     "actionName": "short name",
                     "description": "It will <5-7 words total, starting with 'It will'>",
                     "category": "auto | manual | critical",
-                    "stepGroups": [
-                        {"steps": ["step text derived from the SIIS content"]}
-                    ],
+                    "stepGroups": [{"steps": ["step text derived from the SIIS content"]}],
                 }
             ],
         }
@@ -49,43 +46,93 @@ Rules:
 - "goal" MUST match exactly: "Follow these steps to perform this <Name> Troubleshooting." or "...Configuration."
 - "title" is 2-3 words.
 - action "description" MUST start with "It will" and be 5-7 words total.
-- "category" is "critical" for safety/data-loss steps (like factory reset), "auto" if the step directly flips a device Settings toggle, otherwise "manual". Don't worry about getting auto/manual perfectly right - it will be corrected automatically afterwards.
+- "category" is "critical" for safety/data-loss steps (like factory reset), "auto" if the step directly flips a device Settings toggle, otherwise "manual". It will be corrected automatically afterwards, so don't overthink it.
 - Do not include any URLs, web addresses, or email addresses anywhere in your output.
 - Return ONLY JSON matching the given shape, nothing else - no deeplink fields, those are added separately.
 """
 
 
-def generate(query, siis_response):
-    """Returns a dict shaped like ContextDeeplinkResponse, or raises on failure
-    (pipeline.py falls back to the rule-based generator if this raises)."""
-    cat = get_catalog()
-    content = siis_response.get("content", "")
-    title = siis_response.get("title", "")
-
-    client = _get_client()
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=(
-            f"User query: {query}\n\n"
-            f"SIIS article title: {title}\n"
-            f"SIIS content:\n{content}\n\n"
-            f"Produce troubleshooting guidance in this shape:\n{json.dumps(_SCHEMA_HINT, indent=1)}"
-        ),
-        config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM,
-            response_mime_type="application/json",
-            temperature=0.2,
-        ),
+def _prompt(query, siis):
+    return (
+        f"User query: {query}\n\n"
+        f"SIIS article title: {siis.get('title', '')}\n"
+        f"SIIS content:\n{siis.get('content', '')}\n\n"
+        f"Produce troubleshooting guidance in this shape:\n{json.dumps(_SCHEMA_HINT, indent=1)}"
     )
-    draft = json.loads(resp.text)
 
-    # Attach real deeplinks locally by matching each step's own text - the
-    # model never sees or writes a deeplink URI, so nothing can be hallucinated.
+
+def _parse_json(text):
+    text = (text or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)  # strip code fences if present
+    return json.loads(text)
+
+
+def _call_claude(prompt):
+    import anthropic  # lazy import so the app runs even if the package is missing
+
+    client = anthropic.Anthropic(timeout=TIMEOUT_S)  # reads ANTHROPIC_API_KEY
+    msg = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=3000,
+        temperature=0.2,
+        system=_SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+
+
+def _gemini_client():
+    from google import genai
+    from google.genai import types
+
+    try:  # short timeout + no internal retries so failures are fast; older library versions may lack these
+        opts = types.HttpOptions(timeout=GEMINI_CALL_S * 1000,
+                                 retry_options=types.HttpRetryOptions(attempts=1))
+    except Exception:
+        try:
+            opts = types.HttpOptions(timeout=GEMINI_CALL_S * 1000)
+        except Exception:
+            opts = None
+    return genai.Client(http_options=opts) if opts else genai.Client()
+
+
+def _call_gemini(prompt):
+    from google.genai import types
+
+    client = _gemini_client()
+    start, last = time.time(), None
+    for model in GEMINI_MODELS:
+        if time.time() - start > GEMINI_BUDGET_S - 1:
+            break
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM, response_mime_type="application/json", temperature=0.2),
+            )
+            return resp.text
+        except Exception as e:  # busy / not found / timeout -> try the next model
+            last = e
+    raise last or RuntimeError("no Gemini model available")
+
+
+def generate(query, siis_response):
+    """Return a ContextDeeplinkResponse-shaped dict, or raise (pipeline falls back)."""
+    prompt = _prompt(query, siis_response)
+    if os.getenv("ANTHROPIC_API_KEY"):
+        raw = _call_claude(prompt)
+    elif os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        raw = _call_gemini(prompt)
+    else:
+        raise RuntimeError("No LLM key set (ANTHROPIC_API_KEY or GEMINI_API_KEY)")
+    draft = _parse_json(raw)
+
+    cat = get_catalog()
     for g in draft.get("contexts", []):
         for a in g.get("actions", []):
             for sg in a.get("stepGroups", []):
-                match = cat.match(" ".join(sg.get("steps", [])))
-                sg["actionableDeeplink"] = cat.actionable(match) if match else None
-                sg["validationDeeplink"] = cat.validation(match) if match else None
-
+                m = cat.match(" ".join(sg.get("steps", [])))
+                sg["actionableDeeplink"] = cat.actionable(m) if m else None
+                sg["validationDeeplink"] = cat.validation(m) if m else None
     return draft
