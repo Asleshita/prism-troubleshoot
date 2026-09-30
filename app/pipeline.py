@@ -49,3 +49,25 @@ def warm_cache(items):
     """items: iterable of (query, siis_response). Call at startup so first hits are fast."""
     for q, s in items:
         troubleshoot(q, s)
+
+
+def load_cached_results(results_path, siis_path):
+    """Fill the cache from a saved results.jsonl (no LLM calls). Returns how many articles were cached."""
+    import json
+    try:
+        rows = json.load(open(siis_path, encoding="utf-8"))["responses"]
+        saved = {}
+        for line in open(results_path, encoding="utf-8"):
+            d = json.loads(line)
+            saved[d["query"]] = d["response"]
+    except Exception:
+        return 0
+    n = 0
+    for r in rows:
+        resp = saved.get(r["original_query"])
+        if resp and not validate(resp):
+            key = _siis_key(r["siis_response"])
+            if key not in _cache:
+                _cache[key] = resp
+                n += 1
+    return n

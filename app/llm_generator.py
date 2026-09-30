@@ -9,18 +9,12 @@ rule-based fallback instead - the API never returns an error.
 import json
 import os
 import re
-import time
 
 from .deeplinks import get_catalog
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")  # fast: helps the 8s cold-start limit
-# Tried in order; if one is busy (503) or missing (404) the next is used automatically.
-GEMINI_MODELS = [m.strip() for m in os.getenv(
-    "GEMINI_MODELS", os.getenv("GEMINI_MODEL", "") or "gemini-3.1-flash-lite,gemini-3.8-flash,gemini-3.5-flash"
-).split(",") if m.strip()]
-TIMEOUT_S = 20          # Claude call timeout
-GEMINI_CALL_S = int(os.getenv("GEMINI_CALL_S", "10"))  # Gemini rejects anything under 10s
-GEMINI_BUDGET_S = 13    # do not start a new attempt after ~12s; busy (503) replies come back fast, so this rarely binds
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")  # fast, single call - no racing/looping
+TIMEOUT_S = 15
 
 _SCHEMA_HINT = {
     "contexts": [
@@ -81,40 +75,18 @@ def _call_claude(prompt):
     return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
 
 
-def _gemini_client():
+def _call_gemini(prompt):
     from google import genai
     from google.genai import types
 
-    try:  # short timeout + no internal retries so failures are fast; older library versions may lack these
-        opts = types.HttpOptions(timeout=GEMINI_CALL_S * 1000,
-                                 retry_options=types.HttpRetryOptions(attempts=1))
-    except Exception:
-        try:
-            opts = types.HttpOptions(timeout=GEMINI_CALL_S * 1000)
-        except Exception:
-            opts = None
-    return genai.Client(http_options=opts) if opts else genai.Client()
-
-
-def _call_gemini(prompt):
-    from google.genai import types
-
-    client = _gemini_client()
-    start, last = time.time(), None
-    for model in GEMINI_MODELS:
-        if time.time() - start > GEMINI_BUDGET_S - 1:
-            break
-        try:
-            resp = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=_SYSTEM, response_mime_type="application/json", temperature=0.2),
-            )
-            return resp.text
-        except Exception as e:  # busy / not found / timeout -> try the next model
-            last = e
-    raise last or RuntimeError("no Gemini model available")
+    client = genai.Client()  # library default timeout - no custom deadline, avoids the 10s-minimum trap
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=_SYSTEM, response_mime_type="application/json", temperature=0.2),
+    )
+    return resp.text
 
 
 def generate(query, siis_response):
