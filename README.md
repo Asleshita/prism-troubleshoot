@@ -1,4 +1,4 @@
-# Smart Guided Troubleshooting Engine — PRISM GenAI Hackathon 3.0 (Theme 2)
+# Smart Guided Troubleshooting Engine - PRISM GenAI Hackathon 3.0 (Theme 2)
 
 Turns a raw Samsung SIIS support article and a user's query into a
 structured, deeplink-enriched troubleshooting guide.
@@ -52,7 +52,7 @@ set GEMINI_API_KEY=your_key_here          # Windows CMD
 
 If no key is set, or the Gemini call fails for any reason, the API
 automatically falls back to a rule-based generator that derives steps
-directly from the SIIS text — the API never errors or returns empty.
+directly from the SIIS text - the API never errors or returns empty.
 
 ## Run
 
@@ -60,7 +60,7 @@ directly from the SIIS text — the API never errors or returns empty.
 uvicorn app.main:app --reload
 ```
 
-- Health check: `GET http://localhost:8000/health` → `{"status": "ok"}`
+- Health check: `GET http://localhost:8000/health` -> `{"status": "ok"}`
 - API docs / try it out: `http://localhost:8000/docs`
 - Main endpoint: `POST http://localhost:8000/v1/troubleshoot`
 
@@ -90,7 +90,7 @@ python scripts/selfcheck.py
 Runs every sample query through the live pipeline and checks it against
 every formatting rule (goal regex, title length, description rule, score
 range, auto-actions-have-deeplinks, zero URL leaks) plus the official
-`schema.py` if `pydantic` is installed. Prints cold/warm latency per query.
+`schema.py`. Prints cold/warm latency per query.
 
 ## Generate the results.jsonl submission file
 
@@ -98,20 +98,23 @@ range, auto-actions-have-deeplinks, zero URL leaks) plus the official
 python scripts/generate_results.py
 ```
 Produces `results.jsonl` at the repo root: one line per kit query, each with
-8-10 diverse query_variations and the full response — the required offline
+8-10 diverse query_variations and the full response - the required offline
 results format.
 
 ## Caching
 
 Responses are cached by the SIIS article's content hash, so repeat calls and
 paraphrases of the same underlying article are served from cache in well
-under 300ms (p95). The cache is warmed with all 20 kit queries at startup so
-the first live call for each is already fast.
+under 300ms (p95). At startup, the server loads pre-computed answers from
+`results.jsonl` straight into the cache (no LLM calls), so `/health` and the
+20 kit scenarios are already fast the moment the server comes up. Any query
+not already in `results.jsonl` is answered live on first request and cached
+after that.
 
 ## Tech stack
 
 - Python 3.11, FastAPI, Pydantic v2
-- Google Gemini (`gemini-2.5-flash`) for query understanding and step drafting
+- Google Gemini (`gemini-3.1-flash-lite`) for query understanding and step drafting
 - In-memory cache keyed on SIIS content hash
 - Rule-based fallback generator (no external dependency) as a safety net
 
